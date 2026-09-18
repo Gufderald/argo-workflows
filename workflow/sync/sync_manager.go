@@ -809,8 +809,45 @@ func (sm *Manager) ReleaseAll(ctx context.Context, wf *wfv1.Workflow) bool {
 		}
 	}
 
+	sm.removeWorkflowFromQueues(ctx, wf)
+
 	wf.Status.Synchronization = nil
 	return true
+}
+
+// removeWorkflowFromQueues drops every pending entry that belongs to wf from every lock,
+// whatever holder key form it used (namespace/name for a workflow-level lock,
+// namespace/name/nodeID for a template-level lock).
+//
+// The status-driven removals in ReleaseAll are not sufficient on their own: prepAcquire
+// enqueues the holder on every lock of the template, but a node records only the first
+// lock it could not acquire (NodeSynchronizationStatus.Waiting), MutexStatus.Waiting is
+// never recorded for a mutex that had no holder, and Status.Nodes may already be
+// dehydrated by the time persistUpdates calls ReleaseAll. An entry left at the front of a
+// queue blocks every later requester of that lock ("isn't at the front") until the
+// controller restarts. The caller must hold sm.lock.
+func (sm *Manager) removeWorkflowFromQueues(ctx context.Context, wf *wfv1.Workflow) {
+	wfKey := getHolderKey(wf, "")
+	for lockName, lock := range sm.syncLockMap {
+		// getCurrentPending returns a fresh slice, so removing while ranging over it
+		// cannot disturb the priority queue's heap.
+		pending, err := lock.getCurrentPending(ctx)
+		if err != nil {
+			sm.log.WithField("lock", lockName).WithError(err).Warn(ctx, "failed to get current lock pending")
+			continue
+		}
+		for _, key := range pending {
+			owner, err := sm.getWorkflowKey(key)
+			if err != nil || owner != wfKey {
+				continue
+			}
+			if err := lock.removeFromQueue(ctx, key); err != nil {
+				sm.log.WithFields(logging.Fields{"holderKey": key, "lock": lockName}).WithError(err).Warn(ctx, "Error removing from queue")
+				continue
+			}
+			sm.log.WithFields(logging.Fields{"holderKey": key, "lock": lockName}).Info(ctx, "Removed stale queue entry left behind by finished workflow")
+		}
+	}
 }
 
 func ensureInit(wf *wfv1.Workflow, lockType wfv1.SynchronizationType) {

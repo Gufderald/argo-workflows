@@ -13,11 +13,13 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/upper/db/v4"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	wfv1 "github.com/argoproj/argo-workflows/v4/pkg/apis/workflow/v1alpha1"
 
 	"github.com/argoproj/argo-workflows/v4/util/sqldb"
+	syncdb "github.com/argoproj/argo-workflows/v4/util/sync/db"
 )
 
 const wfWithDatabaseSemaphore = `
@@ -240,6 +242,52 @@ func TestSyncManagersContendingForSemaphore(t *testing.T) {
 	for _, dbType := range testDBTypes {
 		t.Run(string(dbType), func(t *testing.T) {
 			testSyncManagersContendingForSemaphore(t, dbType)
+		})
+	}
+}
+
+// TestReleaseAllRemovesOnlyOwnControllerPendingRow checks that a controller sharing the
+// database only removes its own pending entries when a workflow finishes: a workflow with
+// the same namespace and name may be queued by another controller at the same time.
+func TestReleaseAllRemovesOnlyOwnControllerPendingRow(t *testing.T) {
+	for _, dbType := range testDBTypes {
+		t.Run(string(dbType), func(t *testing.T) {
+			ctx, deferfn, syncMgr1, syncMgr2 := setupMultipleLockManagers(t, dbType, 1)
+			defer deferfn()
+
+			now := time.Now()
+			wfHold := wfv1.MustUnmarshalWorkflow(wfWithDatabaseSemaphore)
+			wfHold.Name = "wf-hold"
+			wfHold.CreationTimestamp = metav1.NewTime(now)
+			checkCanAcquire(ctx, t, syncMgr1, wfHold)
+
+			// The same workflow key is queued by both controllers.
+			wfX := wfv1.MustUnmarshalWorkflow(wfWithDatabaseSemaphore)
+			wfX.Name = "wf-x"
+			wfX.CreationTimestamp = metav1.NewTime(now.Add(time.Second))
+			wfX2 := wfX.DeepCopy()
+			checkCannotAcquire(ctx, t, syncMgr1, wfX)
+			checkCannotAcquire(ctx, t, syncMgr2, wfX2)
+
+			pendingRows := func() []syncdb.StateRecord {
+				var rows []syncdb.StateRecord
+				err := syncMgr1.dbInfo.SessionProxy.Session().SQL().
+					SelectFrom(syncMgr1.dbInfo.Config.StateTable).
+					Where(db.Cond{syncdb.StateKeyField: getHolderKey(wfX, wfX.Name), syncdb.StateHeldField: false}).
+					All(&rows)
+				require.NoError(t, err)
+				return rows
+			}
+			require.Len(t, pendingRows(), 2)
+
+			// Releasing on one controller must leave the other controller's entry alone.
+			syncMgr1.ReleaseAll(ctx, wfX)
+			rows := pendingRows()
+			require.Len(t, rows, 1)
+			assert.Equal(t, "test2", rows[0].Controller)
+
+			syncMgr2.ReleaseAll(ctx, wfX2)
+			assert.Empty(t, pendingRows())
 		})
 	}
 }

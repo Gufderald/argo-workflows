@@ -234,12 +234,16 @@ func (q *syncQueries) AddToQueue(ctx context.Context, record *StateRecord) error
 	})
 }
 
+// RemoveFromQueue deletes a pending entry queued by this controller. Pending rows are
+// owned by the controller that queued them: a workflow with the same namespace and name
+// running under another controller that shares the database must keep its place.
 func (q *syncQueries) RemoveFromQueue(ctx context.Context, semaphoreName, holderKey string) error {
 	return q.sessionProxy.With(ctx, func(session db.Session) error {
 		_, err := session.SQL().
 			DeleteFrom(q.config.StateTable).
 			Where(db.Cond{StateNameField: semaphoreName}).
 			And(db.Cond{StateKeyField: holderKey}).
+			And(db.Cond{StateControllerField: q.config.ControllerName}).
 			And(db.Cond{StateHeldField: false}).
 			Exec()
 		return err

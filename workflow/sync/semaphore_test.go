@@ -405,3 +405,72 @@ func TestNewSemaphoreWithZeroLimit(t *testing.T) {
 		})
 	}
 }
+
+// TestInternalSemaphoreRemoveFromQueueNotifiesNextWaiter checks that removing a queue
+// entry wakes up whoever is next in line when the lock has capacity. The removed entry
+// may belong to a workflow that never held the lock, so no release() will ever run on
+// its behalf.
+func TestInternalSemaphoreRemoveFromQueueNotifiesNextWaiter(t *testing.T) {
+	newSemaphore := func(ctx context.Context, t *testing.T, notified map[string]bool) *prioritySemaphore {
+		t.Helper()
+		sem, err := newInternalSemaphore(ctx, "default/ConfigMap/my-config/workflow", func(key string) {
+			notified[key] = true
+		}, func(_ context.Context, _ string) (int, error) { return 1, nil }, 0)
+		require.NoError(t, err)
+		return sem
+	}
+	now := time.Now()
+
+	t.Run("RemovingHeadWakesNext", func(t *testing.T) {
+		ctx := logging.TestContext(t.Context())
+		notified := map[string]bool{}
+		sem := newSemaphore(ctx, t, notified)
+		require.NoError(t, sem.addToQueue(ctx, "default/wf-a", 0, now))
+		require.NoError(t, sem.addToQueue(ctx, "default/wf-b", 0, now.Add(time.Second)))
+		clear(notified)
+
+		require.NoError(t, sem.removeFromQueue(ctx, "default/wf-a"))
+
+		pending, err := sem.getCurrentPending(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"default/wf-b"}, pending)
+		assert.True(t, notified["default/wf-b"], "next waiter should be notified, notified: %v", notified)
+		assert.False(t, notified["default/wf-a"])
+	})
+
+	t.Run("AbsentKeyIsNoop", func(t *testing.T) {
+		ctx := logging.TestContext(t.Context())
+		notified := map[string]bool{}
+		sem := newSemaphore(ctx, t, notified)
+		require.NoError(t, sem.addToQueue(ctx, "default/wf-a", 0, now))
+		require.NoError(t, sem.addToQueue(ctx, "default/wf-b", 0, now.Add(time.Second)))
+		clear(notified)
+
+		require.NoError(t, sem.removeFromQueue(ctx, "default/absent"))
+
+		pending, err := sem.getCurrentPending(ctx)
+		require.NoError(t, err)
+		assert.ElementsMatch(t, []string{"default/wf-a", "default/wf-b"}, pending)
+		assert.Empty(t, notified)
+	})
+
+	t.Run("NoCapacityNoNotify", func(t *testing.T) {
+		ctx := logging.TestContext(t.Context())
+		notified := map[string]bool{}
+		sem := newSemaphore(ctx, t, notified)
+		require.NoError(t, sem.addToQueue(ctx, "default/wf-a", 0, now))
+		acquired, _, err := sem.tryAcquire(ctx, "default/wf-a", nil)
+		require.NoError(t, err)
+		require.True(t, acquired)
+		require.NoError(t, sem.addToQueue(ctx, "default/wf-b", 0, now.Add(time.Second)))
+		require.NoError(t, sem.addToQueue(ctx, "default/wf-c", 0, now.Add(2*time.Second)))
+		clear(notified)
+
+		require.NoError(t, sem.removeFromQueue(ctx, "default/wf-b"))
+
+		pending, err := sem.getCurrentPending(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"default/wf-c"}, pending)
+		assert.Empty(t, notified, "nothing to wake up while the lock is held")
+	})
+}

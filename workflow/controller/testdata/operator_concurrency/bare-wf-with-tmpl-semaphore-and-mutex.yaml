@@ -1,0 +1,20 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  name: tmpl-semaphore-and-mutex-bare
+  namespace: default
+spec:
+  entrypoint: whalesay
+  templates:
+    - name: whalesay
+      synchronization:
+        semaphores:
+          - configMapKeyRef:
+              name: my-config
+              key: template
+        mutexes:
+          - name: placeholder
+      container:
+        image: docker/whalesay:latest
+        command: [sh, -c]
+        args: ["sleep 99999"]

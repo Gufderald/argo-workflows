@@ -3,6 +3,7 @@ package sync
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/argoproj/argo-workflows/v4/util/logging"
 
@@ -434,4 +435,151 @@ func TestDuplicates(t *testing.T) {
 		_, _, _, _, err = syncManager.TryAcquire(ctx, wfdupsemaphore, "", wfdupsemaphore.Spec.Synchronization)
 		assert.Error(t, err)
 	})
+}
+
+// TestReleaseAllRemovesWorkflowFromEveryQueue covers a workflow that requests several
+// locks, is queued on all of them while one is busy, and finishes without ever acquiring
+// them (for example a node that errors on its second reconcile). ReleaseAll must drop it
+// from every queue, not only from the lock recorded in the status, and wake up the next
+// waiter behind it: an entry left at the front of a queue blocks that lock until the
+// controller restarts.
+func TestReleaseAllRemovesWorkflowFromEveryQueue(t *testing.T) {
+	semaphore := func() *wfv1.SemaphoreRef {
+		return &wfv1.SemaphoreRef{ConfigMapKeyRef: &v1.ConfigMapKeySelector{
+			LocalObjectReference: v1.LocalObjectReference{Name: "my-config"},
+			Key:                  "template",
+		}}
+	}
+	mutex := func(name string) *wfv1.Mutex { return &wfv1.Mutex{Name: name} }
+	bareWorkflow := func(name string, created time.Time) *wfv1.Workflow {
+		return &wfv1.Workflow{ObjectMeta: metav1.ObjectMeta{
+			Name:              name,
+			Namespace:         "default",
+			CreationTimestamp: metav1.NewTime(created),
+		}}
+	}
+
+	tests := []struct {
+		name       string
+		nodeName   string
+		holderSync *wfv1.Synchronization
+		leakerSync *wfv1.Synchronization
+		victimSync *wfv1.Synchronization
+		busyLock   string
+		freeLock   string
+		dehydrate  bool
+	}{
+		{
+			name:       "TemplateSemaphoreAndMutex",
+			nodeName:   "node-1",
+			holderSync: &wfv1.Synchronization{Semaphores: []*wfv1.SemaphoreRef{semaphore()}, Mutexes: []*wfv1.Mutex{mutex("a")}},
+			leakerSync: &wfv1.Synchronization{Semaphores: []*wfv1.SemaphoreRef{semaphore()}, Mutexes: []*wfv1.Mutex{mutex("b")}},
+			victimSync: &wfv1.Synchronization{Mutexes: []*wfv1.Mutex{mutex("b")}},
+			busyLock:   "default/ConfigMap/my-config/template",
+			freeLock:   "default/Mutex/b",
+		},
+		{
+			name:       "TemplateMutexAndMutex",
+			nodeName:   "node-1",
+			holderSync: &wfv1.Synchronization{Mutexes: []*wfv1.Mutex{mutex("x"), mutex("a")}},
+			leakerSync: &wfv1.Synchronization{Mutexes: []*wfv1.Mutex{mutex("x"), mutex("b")}},
+			victimSync: &wfv1.Synchronization{Mutexes: []*wfv1.Mutex{mutex("b")}},
+			busyLock:   "default/Mutex/x",
+			freeLock:   "default/Mutex/b",
+		},
+		{
+			// A mutex without a holder is never recorded in Status.Synchronization.Mutex.Waiting.
+			name:       "WorkflowLevelMutexAndMutex",
+			holderSync: &wfv1.Synchronization{Mutexes: []*wfv1.Mutex{mutex("x"), mutex("a")}},
+			leakerSync: &wfv1.Synchronization{Mutexes: []*wfv1.Mutex{mutex("x"), mutex("b")}},
+			victimSync: &wfv1.Synchronization{Mutexes: []*wfv1.Mutex{mutex("b")}},
+			busyLock:   "default/Mutex/x",
+			freeLock:   "default/Mutex/b",
+		},
+		{
+			// Node statuses are offloaded before ReleaseAll runs when offloading is enabled.
+			name:       "TemplateDehydratedNodes",
+			nodeName:   "node-1",
+			holderSync: &wfv1.Synchronization{Semaphores: []*wfv1.SemaphoreRef{semaphore()}, Mutexes: []*wfv1.Mutex{mutex("a")}},
+			leakerSync: &wfv1.Synchronization{Semaphores: []*wfv1.SemaphoreRef{semaphore()}, Mutexes: []*wfv1.Mutex{mutex("b")}},
+			victimSync: &wfv1.Synchronization{Mutexes: []*wfv1.Mutex{mutex("b")}},
+			busyLock:   "default/ConfigMap/my-config/template",
+			freeLock:   "default/Mutex/b",
+			dehydrate:  true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := logging.TestContext(t.Context())
+			kube := fake.NewClientset()
+			var cm v1.ConfigMap
+			wfv1.MustUnmarshal(configMap, &cm)
+			_, err := kube.CoreV1().ConfigMaps("default").Create(ctx, &cm, metav1.CreateOptions{})
+			require.NoError(t, err)
+			notified := map[string]bool{}
+			syncManager, err := NewLockManager(ctx, kube, "", nil, GetSyncLimitFunc(kube), func(key string) {
+				notified[key] = true
+			}, WorkflowExistenceFunc, false)
+			require.NoError(t, err)
+
+			now := time.Now()
+			holder := bareWorkflow("holder", now)
+			leaker := bareWorkflow("leaker", now.Add(time.Second))
+			victim := bareWorkflow("victim", now.Add(2*time.Second))
+
+			status, _, _, _, err := syncManager.TryAcquire(ctx, holder, tt.nodeName, tt.holderSync)
+			require.NoError(t, err)
+			require.True(t, status, "holder should acquire its locks")
+
+			// The leaker is queued on both locks but only records the busy one.
+			status, _, msg, failedLockName, err := syncManager.TryAcquire(ctx, leaker, tt.nodeName, tt.leakerSync)
+			require.NoError(t, err)
+			require.False(t, status, "leaker should wait for the busy lock")
+			require.Equal(t, tt.busyLock, failedLockName)
+			assert.Contains(t, msg, "Waiting for")
+			leakerKey := getHolderKey(leaker, tt.nodeName)
+			if tt.nodeName != "" {
+				// This is what markNodeWaitingForLock records in the controller.
+				leaker.Status.Nodes = wfv1.Nodes{tt.nodeName: wfv1.NodeStatus{
+					ID:                    tt.nodeName,
+					Name:                  tt.nodeName,
+					Phase:                 wfv1.NodeError,
+					SynchronizationStatus: &wfv1.NodeSynchronizationStatus{Waiting: failedLockName},
+				}}
+			}
+			for _, lockName := range []string{tt.busyLock, tt.freeLock} {
+				var pending []string
+				pending, err = syncManager.syncLockMap[lockName].getCurrentPending(ctx)
+				require.NoError(t, err)
+				assert.Contains(t, pending, leakerKey, "leaker should be queued on %s", lockName)
+			}
+
+			// The victim only needs the free lock but is stuck behind the leaker's entry.
+			status, _, msg, _, err = syncManager.TryAcquire(ctx, victim, tt.nodeName, tt.victimSync)
+			require.NoError(t, err)
+			require.False(t, status, "victim should be queued behind the leaker")
+			assert.Contains(t, msg, "Waiting for")
+
+			if tt.dehydrate {
+				leaker.Status.Nodes = nil
+			}
+			clear(notified)
+			syncManager.ReleaseAll(ctx, leaker)
+
+			for _, lockName := range []string{tt.busyLock, tt.freeLock} {
+				var pending []string
+				pending, err = syncManager.syncLockMap[lockName].getCurrentPending(ctx)
+				require.NoError(t, err)
+				assert.NotContains(t, pending, leakerKey, "leaker should be removed from %s", lockName)
+			}
+			holders, err := syncManager.syncLockMap[tt.busyLock].getCurrentHolders(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, []string{getHolderKey(holder, tt.nodeName)}, holders, "holder should keep the busy lock")
+			assert.True(t, notified["default/victim"], "victim should be woken up, notified: %v", notified)
+
+			status, _, _, _, err = syncManager.TryAcquire(ctx, victim, tt.nodeName, tt.victimSync)
+			require.NoError(t, err)
+			assert.True(t, status, "victim should acquire the lock once the leaker is gone")
+		})
+	}
 }

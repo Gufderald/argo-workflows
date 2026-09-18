@@ -834,3 +834,87 @@ func findWaitingSyncNodeByID(wf *wfv1.Workflow, id string) *wfv1.NodeStatus {
 	}
 	return nil
 }
+
+const bareWfWithTmplSemaphoreAndMutex = "@testdata/operator_concurrency/bare-wf-with-tmpl-semaphore-and-mutex.yaml"
+
+// TestErroredSyncNodeDoesNotBlockOtherLocks reproduces a node that requests two
+// template-level locks, is queued on both while one of them is busy, and then errors
+// before acquiring anything: an invalid display name is only validated once the node
+// exists, that is on the second reconcile. When its workflow finishes, the entry it left
+// on the free lock must be removed and the workflow queued behind it must be woken up,
+// otherwise that lock stays blocked until the controller restarts.
+func TestErroredSyncNodeDoesNotBlockOtherLocks(t *testing.T) {
+	ctx := logging.TestContext(t.Context())
+	cancel, controller := newController(ctx)
+	defer cancel()
+	notified := map[string]bool{}
+	controller.syncManager, _ = sync.NewLockManager(ctx, controller.kubeclientset, controller.namespace, nil, getSyncLimitFunc(ctx, controller.kubeclientset), func(key string) {
+		notified[key] = true
+	}, workflowExistenceFunc, false)
+	var cm apiv1.ConfigMap
+	wfv1.MustUnmarshal(configMap, &cm)
+	_, err := controller.kubeclientset.CoreV1().ConfigMaps("default").Create(ctx, &cm, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	// The holder takes the only slot of the "template" semaphore and keeps it for the
+	// whole test.
+	holder := wfv1.MustUnmarshalWorkflow(bareWfWithTmplSemaphoreAndMutex)
+	holder.Name = "errored-node-holder"
+	holder.Spec.Templates[0].Synchronization.Mutexes[0].Name = "errored-node-a"
+	holder, err = controller.wfclientset.ArgoprojV1alpha1().Workflows(holder.Namespace).Create(ctx, holder, metav1.CreateOptions{})
+	require.NoError(t, err)
+	wocHolder := newWorkflowOperationCtx(ctx, holder, controller)
+	wocHolder.operate(ctx)
+	require.NotNil(t, wocHolder.wf.Status.Synchronization)
+	require.Len(t, wocHolder.wf.Status.Synchronization.Semaphore.Holding, 1)
+	require.Len(t, wocHolder.wf.Status.Synchronization.Mutex.Holding, 1)
+
+	// The leaker needs the semaphore and its own mutex. On the first reconcile its node
+	// is created Pending, queued on both locks, and records only the semaphore.
+	leaker := wfv1.MustUnmarshalWorkflow(bareWfWithTmplSemaphoreAndMutex)
+	leaker.Name = "errored-node-leaker"
+	leaker.Spec.Templates[0].Synchronization.Mutexes[0].Name = "errored-node-b"
+	leaker.Spec.Templates[0].Annotations = map[string]string{string(wfv1.TemplateAnnotationDisplayName): "bad display name"}
+	leaker, err = controller.wfclientset.ArgoprojV1alpha1().Workflows(leaker.Namespace).Create(ctx, leaker, metav1.CreateOptions{})
+	require.NoError(t, err)
+	wocLeaker := newWorkflowOperationCtx(ctx, leaker, controller)
+	wocLeaker.operate(ctx)
+	leakerNode := findWaitingSyncNode(wocLeaker.wf)
+	require.NotNil(t, leakerNode, "expected the leaker's node to wait for the semaphore")
+	assert.Equal(t, wfv1.NodePending, leakerNode.Phase)
+	assert.Equal(t, "default/ConfigMap/my-config/template", leakerNode.SynchronizationStatus.Waiting)
+
+	// The victim only needs the leaker's mutex, which nobody holds, but it is queued
+	// behind the leaker.
+	victim := wfv1.MustUnmarshalWorkflow(bareWfWithTmplMutex)
+	victim.Name = "errored-node-victim"
+	victim.Spec.Templates[0].Synchronization.Mutexes[0].Name = "errored-node-b"
+	victim, err = controller.wfclientset.ArgoprojV1alpha1().Workflows(victim.Namespace).Create(ctx, victim, metav1.CreateOptions{})
+	require.NoError(t, err)
+	wocVictim := newWorkflowOperationCtx(ctx, victim, controller)
+	wocVictim.operate(ctx)
+	victimNode := findWaitingSyncNode(wocVictim.wf)
+	require.NotNil(t, victimNode, "expected the victim's node to wait for the mutex")
+	assert.Equal(t, "default/Mutex/errored-node-b", victimNode.SynchronizationStatus.Waiting)
+
+	// On the second reconcile the leaker's node fails the display name validation before
+	// any lock is acquired, and the workflow finishes.
+	clear(notified)
+	wocLeaker = newWorkflowOperationCtx(ctx, wocLeaker.wf, controller)
+	wocLeaker.operate(ctx)
+	assert.Equal(t, wfv1.WorkflowError, wocLeaker.wf.Status.Phase)
+	erroredNode, err := wocLeaker.wf.Status.Nodes.Get(leakerNode.ID)
+	require.NoError(t, err)
+	assert.Equal(t, wfv1.NodeError, erroredNode.Phase)
+	assert.Contains(t, erroredNode.Message, "displayName must match the regex")
+	assert.Nil(t, wocLeaker.wf.Status.Synchronization, "all locks should be released when the workflow finishes")
+	assert.True(t, notified["default/"+victim.Name], "victim should be woken up, notified: %v", notified)
+
+	// The victim acquires the mutex on its next reconcile.
+	wocVictim = newWorkflowOperationCtx(ctx, wocVictim.wf, controller)
+	wocVictim.operate(ctx)
+	assert.Nil(t, findWaitingSyncNode(wocVictim.wf), "victim should not wait for a lock anymore")
+	require.NotNil(t, wocVictim.wf.Status.Synchronization)
+	require.NotNil(t, wocVictim.wf.Status.Synchronization.Mutex)
+	assert.Len(t, wocVictim.wf.Status.Synchronization.Mutex.Holding, 1)
+}

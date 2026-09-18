@@ -170,9 +170,16 @@ func (s *prioritySemaphore) addToQueue(ctx context.Context, holderKey string, pr
 }
 
 func (s *prioritySemaphore) removeFromQueue(ctx context.Context, holderKey string) error {
-	logger := s.logger(ctx)
+	if _, ok := s.pending.itemByKey[holderKey]; !ok {
+		return nil
+	}
 	s.pending.remove(holderKey)
-	logger.WithField("holderKey", holderKey).Debug(ctx, "Removed from queue")
+	s.logger(ctx).WithField("holderKey", holderKey).Debug(ctx, "Removed from queue")
+	// The removed entry may have been the front of the queue, and its owner may never
+	// have held the lock, so no release() will run on its behalf: wake whoever is next.
+	if s.pending.Len() > 0 {
+		s.notifyWaiters(ctx)
+	}
 	return nil
 }
 
