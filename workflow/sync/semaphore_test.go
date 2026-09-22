@@ -406,32 +406,45 @@ func TestNewSemaphoreWithZeroLimit(t *testing.T) {
 	}
 }
 
-// TestInternalSemaphoreRemoveFromQueueNotifiesNextWaiter checks that removing a queue
-// entry wakes up whoever is next in line when the lock has capacity. The removed entry
-// may belong to a workflow that never held the lock, so no release() will ever run on
-// its behalf.
-func TestInternalSemaphoreRemoveFromQueueNotifiesNextWaiter(t *testing.T) {
-	newSemaphore := func(ctx context.Context, t *testing.T, notified map[string]bool) *prioritySemaphore {
-		t.Helper()
-		sem, err := newInternalSemaphore(ctx, "default/ConfigMap/my-config/workflow", func(key string) {
-			notified[key] = true
-		}, func(_ context.Context, _ string) (int, error) { return 1, nil }, 0)
-		require.NoError(t, err)
-		return sem
-	}
+// testRemoveFromQueueNotifiesNextWaiter checks that removing a queue entry wakes up
+// whoever is next in line when the lock has capacity. The removed entry may belong to
+// a workflow that never held the lock, so no release() will ever run on its behalf.
+func testRemoveFromQueueNotifiesNextWaiter(t *testing.T, factory semaphoreFactory) {
+	t.Helper()
+	ctx := logging.TestContext(t.Context())
 	now := time.Now()
+	notified := map[string]bool{}
+	s, sessionProxy, cleanup := factory(ctx, t, "bar", "default", 1, func(key string) {
+		notified[key] = true
+	})
+	defer cleanup()
+
+	// The subtests share one semaphore (a database-backed one costs a container per
+	// factory call), so each of them starts from an empty lock and leaves it empty.
+	reset := func(t *testing.T) {
+		t.Helper()
+		holders, err := s.getCurrentHolders(ctx)
+		require.NoError(t, err)
+		for _, key := range holders {
+			require.True(t, s.release(ctx, key))
+		}
+		pending, err := s.getCurrentPending(ctx)
+		require.NoError(t, err)
+		for _, key := range pending {
+			require.NoError(t, s.removeFromQueue(ctx, key))
+		}
+		clear(notified)
+	}
 
 	t.Run("RemovingHeadWakesNext", func(t *testing.T) {
-		ctx := logging.TestContext(t.Context())
-		notified := map[string]bool{}
-		sem := newSemaphore(ctx, t, notified)
-		require.NoError(t, sem.addToQueue(ctx, "default/wf-a", 0, now))
-		require.NoError(t, sem.addToQueue(ctx, "default/wf-b", 0, now.Add(time.Second)))
+		defer reset(t)
+		require.NoError(t, s.addToQueue(ctx, "default/wf-a", 0, now))
+		require.NoError(t, s.addToQueue(ctx, "default/wf-b", 0, now.Add(time.Second)))
 		clear(notified)
 
-		require.NoError(t, sem.removeFromQueue(ctx, "default/wf-a"))
+		require.NoError(t, s.removeFromQueue(ctx, "default/wf-a"))
 
-		pending, err := sem.getCurrentPending(ctx)
+		pending, err := s.getCurrentPending(ctx)
 		require.NoError(t, err)
 		assert.Equal(t, []string{"default/wf-b"}, pending)
 		assert.True(t, notified["default/wf-b"], "next waiter should be notified, notified: %v", notified)
@@ -439,38 +452,61 @@ func TestInternalSemaphoreRemoveFromQueueNotifiesNextWaiter(t *testing.T) {
 	})
 
 	t.Run("AbsentKeyIsNoop", func(t *testing.T) {
-		ctx := logging.TestContext(t.Context())
-		notified := map[string]bool{}
-		sem := newSemaphore(ctx, t, notified)
-		require.NoError(t, sem.addToQueue(ctx, "default/wf-a", 0, now))
-		require.NoError(t, sem.addToQueue(ctx, "default/wf-b", 0, now.Add(time.Second)))
+		defer reset(t)
+		require.NoError(t, s.addToQueue(ctx, "default/wf-c", 0, now))
+		require.NoError(t, s.addToQueue(ctx, "default/wf-d", 0, now.Add(time.Second)))
 		clear(notified)
 
-		require.NoError(t, sem.removeFromQueue(ctx, "default/absent"))
+		require.NoError(t, s.removeFromQueue(ctx, "default/absent"))
 
-		pending, err := sem.getCurrentPending(ctx)
+		pending, err := s.getCurrentPending(ctx)
 		require.NoError(t, err)
-		assert.ElementsMatch(t, []string{"default/wf-a", "default/wf-b"}, pending)
+		assert.ElementsMatch(t, []string{"default/wf-c", "default/wf-d"}, pending)
 		assert.Empty(t, notified)
 	})
 
 	t.Run("NoCapacityNoNotify", func(t *testing.T) {
-		ctx := logging.TestContext(t.Context())
-		notified := map[string]bool{}
-		sem := newSemaphore(ctx, t, notified)
-		require.NoError(t, sem.addToQueue(ctx, "default/wf-a", 0, now))
-		acquired, _, err := sem.tryAcquire(ctx, "default/wf-a", nil)
+		defer reset(t)
+		require.NoError(t, s.addToQueue(ctx, "default/wf-e", 0, now))
+		acquired, _, err := s.tryAcquire(ctx, "default/wf-e", sessionProxy)
 		require.NoError(t, err)
 		require.True(t, acquired)
-		require.NoError(t, sem.addToQueue(ctx, "default/wf-b", 0, now.Add(time.Second)))
-		require.NoError(t, sem.addToQueue(ctx, "default/wf-c", 0, now.Add(2*time.Second)))
+		require.NoError(t, s.addToQueue(ctx, "default/wf-f", 0, now.Add(time.Second)))
+		require.NoError(t, s.addToQueue(ctx, "default/wf-g", 0, now.Add(2*time.Second)))
 		clear(notified)
 
-		require.NoError(t, sem.removeFromQueue(ctx, "default/wf-b"))
+		require.NoError(t, s.removeFromQueue(ctx, "default/wf-f"))
 
-		pending, err := sem.getCurrentPending(ctx)
+		pending, err := s.getCurrentPending(ctx)
 		require.NoError(t, err)
-		assert.Equal(t, []string{"default/wf-c"}, pending)
+		assert.Equal(t, []string{"default/wf-g"}, pending)
 		assert.Empty(t, notified, "nothing to wake up while the lock is held")
 	})
+
+	t.Run("ReleasedHolderIsNotPendingAnymore", func(t *testing.T) {
+		// Manager.Release calls release() and then removeFromQueue() for a holder:
+		// the second call must find nothing to remove and must not notify again.
+		defer reset(t)
+		require.NoError(t, s.addToQueue(ctx, "default/wf-h", 0, now))
+		acquired, _, err := s.tryAcquire(ctx, "default/wf-h", sessionProxy)
+		require.NoError(t, err)
+		require.True(t, acquired)
+		require.NoError(t, s.addToQueue(ctx, "default/wf-i", 0, now.Add(time.Second)))
+		require.True(t, s.release(ctx, "default/wf-h"))
+		clear(notified)
+
+		require.NoError(t, s.removeFromQueue(ctx, "default/wf-h"))
+
+		assert.Empty(t, notified, "removing a released holder should not notify again")
+	})
+}
+
+// TestRemoveFromQueueNotifiesNextWaiter runs the removeFromQueue notification test for
+// all semaphore implementations
+func TestRemoveFromQueueNotifiesNextWaiter(t *testing.T) {
+	for name, factory := range semaphoreFactories {
+		t.Run(name, func(t *testing.T) {
+			testRemoveFromQueueNotifiesNextWaiter(t, factory)
+		})
+	}
 }

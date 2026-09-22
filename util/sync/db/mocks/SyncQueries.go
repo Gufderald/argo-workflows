@@ -1274,20 +1274,29 @@ func (_c *SyncQueries_ReleaseHeld_Call) RunAndReturn(run func(ctx context.Contex
 }
 
 // RemoveFromQueue provides a mock function for the type SyncQueries
-func (_mock *SyncQueries) RemoveFromQueue(ctx context.Context, semaphoreName string, holderKey string) error {
+func (_mock *SyncQueries) RemoveFromQueue(ctx context.Context, semaphoreName string, holderKey string) (int64, error) {
 	ret := _mock.Called(ctx, semaphoreName, holderKey)
 
 	if len(ret) == 0 {
 		panic("no return value specified for RemoveFromQueue")
 	}
 
-	var r0 error
-	if returnFunc, ok := ret.Get(0).(func(context.Context, string, string) error); ok {
+	var r0 int64
+	var r1 error
+	if returnFunc, ok := ret.Get(0).(func(context.Context, string, string) (int64, error)); ok {
+		return returnFunc(ctx, semaphoreName, holderKey)
+	}
+	if returnFunc, ok := ret.Get(0).(func(context.Context, string, string) int64); ok {
 		r0 = returnFunc(ctx, semaphoreName, holderKey)
 	} else {
-		r0 = ret.Error(0)
+		r0 = ret.Get(0).(int64)
 	}
-	return r0
+	if returnFunc, ok := ret.Get(1).(func(context.Context, string, string) error); ok {
+		r1 = returnFunc(ctx, semaphoreName, holderKey)
+	} else {
+		r1 = ret.Error(1)
+	}
+	return r0, r1
 }
 
 // SyncQueries_RemoveFromQueue_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'RemoveFromQueue'
@@ -1326,12 +1335,12 @@ func (_c *SyncQueries_RemoveFromQueue_Call) Run(run func(ctx context.Context, se
 	return _c
 }
 
-func (_c *SyncQueries_RemoveFromQueue_Call) Return(err error) *SyncQueries_RemoveFromQueue_Call {
-	_c.Call.Return(err)
+func (_c *SyncQueries_RemoveFromQueue_Call) Return(n int64, err error) *SyncQueries_RemoveFromQueue_Call {
+	_c.Call.Return(n, err)
 	return _c
 }
 
-func (_c *SyncQueries_RemoveFromQueue_Call) RunAndReturn(run func(ctx context.Context, semaphoreName string, holderKey string) error) *SyncQueries_RemoveFromQueue_Call {
+func (_c *SyncQueries_RemoveFromQueue_Call) RunAndReturn(run func(ctx context.Context, semaphoreName string, holderKey string) (int64, error)) *SyncQueries_RemoveFromQueue_Call {
 	_c.Call.Return(run)
 	return _c
 }

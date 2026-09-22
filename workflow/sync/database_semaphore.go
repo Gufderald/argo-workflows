@@ -241,8 +241,18 @@ func (s *databaseSemaphore) addToQueue(ctx context.Context, holderKey string, pr
 }
 
 func (s *databaseSemaphore) removeFromQueue(ctx context.Context, holderKey string) error {
-	err := s.queries.RemoveFromQueue(ctx, s.longDBKey(), holderKey)
-	return err
+	removed, err := s.queries.RemoveFromQueue(ctx, s.longDBKey(), holderKey)
+	if err != nil {
+		return err
+	}
+	// The removed entry may have been the front of the queue, and its owner may never
+	// have held the lock, so no release() will run on its behalf: wake whoever is next.
+	// A row that was already held, or absent, or owned by another controller removes
+	// nothing and must not cost a notification round trip.
+	if removed > 0 {
+		s.notifyWaiters(ctx)
+	}
+	return nil
 }
 
 func (s *databaseSemaphore) checkAcquire(ctx context.Context, holderKey string, tx *sqldb.SessionProxy) (bool, bool, string) {

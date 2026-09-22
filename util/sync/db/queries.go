@@ -73,7 +73,7 @@ type SyncQueries interface {
 	GetStateCountsByController(ctx context.Context, controllerName string) ([]StateCountRecord, error)
 	GetOrderedQueue(ctx context.Context, sessionProxy *sqldb.SessionProxy, semaphoreName string, inactiveTimeout time.Duration) ([]StateRecord, error)
 	AddToQueue(ctx context.Context, record *StateRecord) error
-	RemoveFromQueue(ctx context.Context, semaphoreName, holderKey string) error
+	RemoveFromQueue(ctx context.Context, semaphoreName, holderKey string) (int64, error)
 	CheckQueueExists(ctx context.Context, semaphoreName, holderKey, controllerName string) ([]StateRecord, error)
 	UpdateStateToHeld(ctx context.Context, sessionProxy *sqldb.SessionProxy, semaphoreName, holderKey, controllerName string) error
 	InsertHeldState(ctx context.Context, sessionProxy *sqldb.SessionProxy, record *StateRecord) error
@@ -234,20 +234,27 @@ func (q *syncQueries) AddToQueue(ctx context.Context, record *StateRecord) error
 	})
 }
 
-// RemoveFromQueue deletes a pending entry queued by this controller. Pending rows are
-// owned by the controller that queued them: a workflow with the same namespace and name
-// running under another controller that shares the database must keep its place.
-func (q *syncQueries) RemoveFromQueue(ctx context.Context, semaphoreName, holderKey string) error {
-	return q.sessionProxy.With(ctx, func(session db.Session) error {
-		_, err := session.SQL().
+// RemoveFromQueue deletes a pending entry queued by this controller and returns the
+// number of rows removed. Pending rows are owned by the controller that queued them: a
+// workflow with the same namespace and name running under another controller that
+// shares the database must keep its place.
+func (q *syncQueries) RemoveFromQueue(ctx context.Context, semaphoreName, holderKey string) (int64, error) {
+	var rowsAffected int64
+	err := q.sessionProxy.With(ctx, func(session db.Session) error {
+		result, err := session.SQL().
 			DeleteFrom(q.config.StateTable).
 			Where(db.Cond{StateNameField: semaphoreName}).
 			And(db.Cond{StateKeyField: holderKey}).
 			And(db.Cond{StateControllerField: q.config.ControllerName}).
 			And(db.Cond{StateHeldField: false}).
 			Exec()
+		if err != nil {
+			return err
+		}
+		rowsAffected, err = result.RowsAffected()
 		return err
 	})
+	return rowsAffected, err
 }
 
 func (q *syncQueries) CheckQueueExists(ctx context.Context, semaphoreName, holderKey, controllerName string) ([]StateRecord, error) {
